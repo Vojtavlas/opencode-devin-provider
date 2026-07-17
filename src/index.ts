@@ -1,11 +1,10 @@
-import type { Plugin, Hooks, Config } from "@opencode-ai/plugin";
+import type { Plugin, Hooks, Config, PluginInput } from "@opencode-ai/plugin";
+import type { Model, Auth } from "@opencode-ai/sdk/v2";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { fetchDevinModels } from "./discovery.js";
-
-const DEVIN_CALLBACK_PORT = 59653;
 
 /**
  * Resolve the file:// URL for the `./devin.ts` entry point.
@@ -18,8 +17,11 @@ const DEVIN_PROVIDER_NPM = (() => {
   return pathToFileURL(devinPath).href;
 })();
 
+const DEVIN_CASCADE_URL = "https://server.codeium.com";
+
 // Static fallback models (used when dynamic discovery fails)
 const FALLBACK_MODELS: Record<string, { name: string; reasoning?: boolean }> = {
+  "swe-1-7": { name: "SWE-1-7", reasoning: true },
   "swe-1-6": { name: "SWE-1-6", reasoning: true },
   "gpt-5-6-sol": { name: "GPT-5.6 Sol", reasoning: true },
   "gpt-5-6-luna": { name: "GPT-5.6 Luna", reasoning: true },
@@ -48,26 +50,97 @@ function authPath(): string {
   return path.join(openCodeDataDir(), "auth.json");
 }
 
-interface StoredCredentials {
-  apiKey: string;
-}
-
-async function loadDevinCredentials(): Promise<StoredCredentials | undefined> {
+async function loadDevinApiKey(): Promise<string | undefined> {
+  // Try OpenCode auth store first
   try {
     const raw = await readFile(authPath(), "utf-8");
     const parsed = JSON.parse(raw) as unknown;
-    if (!isObjectRecord(parsed)) return undefined;
-    const devinAuth = parsed.devin;
-    if (!isObjectRecord(devinAuth)) return undefined;
-    const apiKey = typeof devinAuth.key === "string" ? devinAuth.key : undefined;
-    if (!apiKey) return undefined;
-    return { apiKey };
+    if (isObjectRecord(parsed)) {
+      const devinAuth = parsed.devin;
+      if (isObjectRecord(devinAuth)) {
+        const key = typeof devinAuth.key === "string" ? devinAuth.key : undefined;
+        if (key) return key;
+      }
+    }
   } catch {
-    return undefined;
+    // No auth file yet
   }
+  // Fall back to env var
+  return process.env.DEVIN_API_KEY;
 }
 
-const devinPlugin: Plugin = async () => {
+function extractApiKeyFromAuth(auth: Auth | undefined): string | undefined {
+  if (!auth) return undefined;
+  if (auth.type === "api") return auth.key;
+  if (auth.type === "wellknown") return auth.key;
+  return undefined;
+}
+
+function buildModel(
+  modelId: string,
+  name: string,
+  opts: { reasoning: boolean; supportsImages: boolean; contextWindow: number; maxTokens: number },
+): Model {
+  return {
+    id: modelId,
+    providerID: "devin",
+    api: {
+      id: modelId,
+      url: DEVIN_CASCADE_URL,
+      npm: DEVIN_PROVIDER_NPM,
+    },
+    name,
+    capabilities: {
+      temperature: true,
+      reasoning: opts.reasoning,
+      attachment: opts.supportsImages,
+      toolcall: true,
+      input: {
+        text: true,
+        audio: false,
+        image: opts.supportsImages,
+        video: false,
+        pdf: false,
+      },
+      output: {
+        text: true,
+        audio: false,
+        image: false,
+        video: false,
+        pdf: false,
+      },
+      interleaved: false,
+    },
+    cost: {
+      input: 0,
+      output: 0,
+      cache: { read: 0, write: 0 },
+    },
+    limit: {
+      context: opts.contextWindow,
+      output: opts.maxTokens,
+    },
+    status: "active",
+    options: {},
+    headers: {},
+    release_date: "",
+  };
+}
+
+function buildFallbackModels(): Record<string, Model> {
+  const models: Record<string, Model> = {};
+  for (const [id, info] of Object.entries(FALLBACK_MODELS)) {
+    models[id] = buildModel(id, info.name, {
+      reasoning: info.reasoning ?? false,
+      supportsImages: false,
+      contextWindow: 200_000,
+      maxTokens: 64_000,
+    });
+  }
+  return models;
+}
+
+const devinPlugin: Plugin = async (_input: PluginInput) => {
   const hooks: Hooks = {
     auth: {
       provider: "devin",
@@ -100,14 +173,12 @@ const devinPlugin: Plugin = async () => {
     provider: {
       id: "devin",
       async models(_provider, ctx) {
-        const credentials = await loadDevinCredentials();
         const apiKey =
-          credentials?.apiKey ??
-          process.env.DEVIN_API_KEY ??
-          (ctx.auth as any)?.key;
+          extractApiKeyFromAuth(ctx.auth) ??
+          (await loadDevinApiKey()) ??
+          process.env.DEVIN_API_KEY;
 
         if (!apiKey) {
-          // Return fallback models without discovery
           return buildFallbackModels();
         }
 
@@ -116,48 +187,14 @@ const devinPlugin: Plugin = async () => {
           return buildFallbackModels();
         }
 
-        const models: Record<string, any> = {};
+        const models: Record<string, Model> = {};
         for (const m of discovered) {
-          models[m.id] = {
-            id: m.id,
-            name: m.name,
-            api: {
-              id: m.id,
-              url: "https://server.codeium.com",
-              npm: DEVIN_PROVIDER_NPM,
-            },
-            capabilities: {
-              temperature: true,
-              reasoning: m.reasoning,
-              attachment: m.supportsImages,
-              toolcall: true,
-              input: {
-                text: true,
-                audio: false,
-                image: m.supportsImages,
-                video: false,
-                pdf: false,
-              },
-              output: {
-                text: true,
-                audio: false,
-                image: false,
-                video: false,
-                pdf: false,
-              },
-              interleaved: false,
-            },
-            cost: {
-              input: 0,
-              output: 0,
-              cache: { read: 0, write: 0 },
-            },
-            limit: {
-              context: m.contextWindow,
-              output: m.maxTokens,
-            },
-            status: "active" as const,
-          };
+          models[m.id] = buildModel(m.id, m.name, {
+            reasoning: m.reasoning,
+            supportsImages: m.supportsImages,
+            contextWindow: m.contextWindow,
+            maxTokens: m.maxTokens,
+          });
         }
         return models;
       },
@@ -194,12 +231,14 @@ const devinPlugin: Plugin = async () => {
         }
       }
 
-      // Pull credentials from OpenCode's auth store
+      // Pull credentials from OpenCode's auth store or env, inject into provider options
       try {
-        const credentials = await loadDevinCredentials();
-        if (credentials?.apiKey) {
+        const apiKey = await loadDevinApiKey();
+        if (apiKey) {
           cfg.provider.devin.options = cfg.provider.devin.options ?? {};
-          cfg.provider.devin.options.apiKey = credentials.apiKey;
+          if (!cfg.provider.devin.options.apiKey) {
+            cfg.provider.devin.options.apiKey = apiKey;
+          }
         }
       } catch {
         // Env vars or manually configured options will still work.
@@ -209,33 +248,5 @@ const devinPlugin: Plugin = async () => {
 
   return hooks;
 };
-
-function buildFallbackModels(): Record<string, any> {
-  const models: Record<string, any> = {};
-  for (const [id, info] of Object.entries(FALLBACK_MODELS)) {
-    models[id] = {
-      id,
-      name: info.name,
-      api: {
-        id,
-        url: "https://server.codeium.com",
-        npm: DEVIN_PROVIDER_NPM,
-      },
-      capabilities: {
-        temperature: true,
-        reasoning: info.reasoning ?? false,
-        attachment: false,
-        toolcall: true,
-        input: { text: true, audio: false, image: false, video: false, pdf: false },
-        output: { text: true, audio: false, image: false, video: false, pdf: false },
-        interleaved: false,
-      },
-      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-      limit: { context: 200_000, output: 64_000 },
-      status: "active" as const,
-    };
-  }
-  return models;
-}
 
 export default devinPlugin;
