@@ -27,18 +27,6 @@ import {
   MetadataSchema,
   StopReason,
 } from "./devin-gen/exa/codeium_common_pb/codeium_common_pb";
-import type {
-  LanguageModelV1,
-  LanguageModelV1CallOptions,
-  LanguageModelV1FinishReason,
-  LanguageModelV1StreamPart,
-  LanguageModelV1Prompt,
-  LanguageModelV1TextPart,
-  LanguageModelV1ImagePart,
-  LanguageModelV1FilePart,
-  LanguageModelV1ToolCallPart,
-  LanguageModelV1ToolResultPart,
-} from "@ai-sdk/provider";
 import { APICallError } from "@ai-sdk/provider";
 
 /** Base host for Codeium/Windsurf's Cascade chat API (Connect protocol over HTTP/1.1). */
@@ -49,28 +37,60 @@ const DEVIN_IDE_VERSION = "3.2.23";
 const DEVIN_EXTENSION_VERSION = "1.48.2";
 const DEVIN_SESSION_TOKEN_PREFIX = "devin-session-token$";
 const DEVIN_AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt";
-const DEVIN_DEFAULT_STOP_PATTERNS = ["<|user|>", "<|bot|>", "<|context_request|>", "<|endoftext|>", "<|end_of_turn|>"];
+const DEVIN_DEFAULT_STOP_PATTERNS = ["\u0004", "<|bot|>", "<|context_request|>", "\u0019", "<|end_of_turn|>"];
 
 const CONNECT_COMPRESSED_FLAG = 0x01;
 const CONNECT_END_STREAM_FLAG = 0x02;
 const MAX_CONNECT_FRAME_PAYLOAD = 16 * 1024 * 1024;
 
 export interface DevinCascadeSettings {
-  /** Devin CLI session token (obtained via `devin login` or OAuth). */
   apiKey?: string;
-  /** Codeium/Windsurf Cascade API base URL. Defaults to `https://server.codeium.com`. */
   baseURL?: string;
-  /** Additional headers to send with every request. */
   headers?: Record<string, string | undefined>;
-  /** Custom fetch implementation. Useful for tests. */
   fetchImpl?: typeof fetch;
 }
 
 export interface DevinCascadeModelSettings {
-  /** Wire model UID selected after thinking-effort routing. */
   chatModelUid?: string;
-  /** Cascade conversation id; reused so the server threads turns. */
   conversationId?: string;
+}
+
+// V3 types (OpenCode uses LanguageModelV3)
+interface V3Prompt extends Array<V3Message> {}
+interface V3Message {
+  role: "system" | "user" | "assistant" | "tool";
+  content: any;
+  providerOptions?: Record<string, Record<string, unknown>>;
+}
+
+interface V3CallOptions {
+  prompt: V3Prompt;
+  maxOutputTokens?: number;
+  temperature?: number;
+  stopSequences?: string[];
+  topP?: number;
+  topK?: number;
+  tools?: any[];
+  toolChoice?: any;
+  abortSignal?: AbortSignal;
+  headers?: Record<string, string | undefined>;
+  providerOptions?: Record<string, Record<string, unknown>>;
+}
+
+interface V3StreamPart {
+  type: string;
+  [key: string]: unknown;
+}
+
+interface V3FinishReason {
+  unified: "stop" | "length" | "content-filter" | "tool-calls" | "error" | "other";
+  raw?: string;
+}
+
+interface V3Usage {
+  inputTokens: { total: number | undefined; noCache: number | undefined; cacheRead: number | undefined; cacheWrite: number | undefined };
+  outputTokens: { total: number | undefined; text: number | undefined; reasoning: number | undefined };
+  raw?: Record<string, unknown>;
 }
 
 function normalizeDevinSessionToken(apiKey: string | undefined): string {
@@ -143,50 +163,7 @@ function decodeDevinUserJwtResponse(payload: Uint8Array) {
   }
 }
 
-function stringifyUserPart(
-  part: LanguageModelV1TextPart | LanguageModelV1ImagePart | LanguageModelV1FilePart,
-): string {
-  switch (part.type) {
-    case "text":
-      return part.text;
-    case "image":
-      return "[image]";
-    case "file":
-      return `[file: ${part.mimeType}]`;
-    default:
-      return "";
-  }
-}
-
-function stringifyAssistantPart(
-  part:
-    | LanguageModelV1TextPart
-    | LanguageModelV1FilePart
-    | LanguageModelV1ToolCallPart
-    | { type: "reasoning"; text?: string }
-    | { type: "redacted-reasoning"; data: string },
-): string {
-  switch (part.type) {
-    case "text":
-      return part.text;
-    case "file":
-      return `[file: ${(part as LanguageModelV1FilePart).mimeType}]`;
-    case "tool-call":
-      return `[tool-call: ${part.toolName}(${JSON.stringify(part.args)})]`;
-    case "reasoning":
-      return "[reasoning]";
-    case "redacted-reasoning":
-      return "[redacted-reasoning]";
-    default:
-      return "";
-  }
-}
-
-function stringifyToolPart(part: LanguageModelV1ToolResultPart): string {
-  return `[tool-result: ${part.toolName} = ${JSON.stringify(part.result)}]`;
-}
-
-function renderSystemPrompt(prompt: LanguageModelV1Prompt): string {
+function renderSystemPrompt(prompt: V3Prompt): string {
   const lines: string[] = [];
   for (const message of prompt) {
     if (message.role === "system") {
@@ -196,25 +173,26 @@ function renderSystemPrompt(prompt: LanguageModelV1Prompt): string {
   return lines.join("\n\n");
 }
 
-function buildChatMessagePrompts(
-  prompt: LanguageModelV1Prompt,
-  cascadeId: string,
-): ChatMessagePrompt[] {
+function deterministicUuid(seed: string): string {
+  const hash = Buffer.from(seed).toString("base64url").slice(0, 22);
+  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
+}
+
+function buildChatMessagePrompts(prompt: V3Prompt, cascadeId: string): ChatMessagePrompt[] {
   const prompts: ChatMessagePrompt[] = [];
   for (const [index, msg] of prompt.entries()) {
     if (msg.role === "user") {
       let promptText = "";
       const images: ReturnType<typeof create<typeof ImageDataSchema>>[] = [];
-      for (const part of msg.content) {
+      const content = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: msg.content }];
+      for (const part of content) {
         if (part.type === "text") {
           promptText += part.text;
-        } else if (part.type === "image") {
-          images.push(
-            create(ImageDataSchema, {
-              base64Data: part.image instanceof Uint8Array ? Buffer.from(part.image).toString("base64") : "",
-              mimeType: part.mimeType ?? "image/png",
-            }),
-          );
+        } else if (part.type === "file" && part.mediaType?.startsWith("image/")) {
+          const data = part.data instanceof Uint8Array
+            ? Buffer.from(part.data).toString("base64")
+            : typeof part.data === "string" ? part.data : "";
+          images.push(create(ImageDataSchema, { base64Data: data, mimeType: part.mediaType ?? "image/png" }));
         }
       }
       prompts.push(
@@ -233,12 +211,14 @@ function buildChatMessagePrompts(
       for (const part of msg.content) {
         if (part.type === "text") {
           promptText += part.text;
+        } else if (part.type === "reasoning") {
+          thinkingText += part.text;
         } else if (part.type === "tool-call") {
           toolCalls.push(
             create(ChatToolCallSchema, {
               id: part.toolCallId,
               name: part.toolName,
-              argumentsJson: JSON.stringify(part.args),
+              argumentsJson: JSON.stringify(part.input ?? part.args ?? {}),
             }),
           );
         }
@@ -256,17 +236,28 @@ function buildChatMessagePrompts(
       );
     } else if (msg.role === "tool") {
       let resultText = "";
+      let toolCallId = "";
       for (const part of msg.content) {
         if (part.type === "tool-result") {
-          resultText += JSON.stringify(part.result);
+          toolCallId = part.toolCallId;
+          const output = part.output;
+          if (typeof output === "string") {
+            resultText += output;
+          } else if (output && typeof output === "object" && "type" in output) {
+            if (output.type === "text") resultText += output.value;
+            else if (output.type === "json") resultText += JSON.stringify(output.value);
+            else resultText += JSON.stringify(output);
+          } else if (part.result !== undefined) {
+            resultText += JSON.stringify(part.result);
+          }
         }
       }
       prompts.push(
         create(ChatMessagePromptSchema, {
-          messageId: deterministicUuid(`${cascadeId}\0${index}\0tool\0${msg.content[0]?.toolCallId ?? ""}`),
+          messageId: deterministicUuid(`${cascadeId}\0${index}\0tool\0${toolCallId}`),
           source: ChatMessageSource.TOOL,
-          toolCallId: msg.content[0]?.toolCallId ?? "",
-          toolResultIsError: msg.content[0]?.isError ?? false,
+          toolCallId,
+          toolResultIsError: false,
           prompt: resultText,
         }),
       );
@@ -275,16 +266,11 @@ function buildChatMessagePrompts(
   return prompts;
 }
 
-function deterministicUuid(seed: string): string {
-  const hash = Buffer.from(seed).toString("base64url").slice(0, 22);
-  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
-}
-
 function buildDevinChatRequest(
   modelId: string,
   chatModelUid: string | undefined,
-  prompt: LanguageModelV1Prompt,
-  options: LanguageModelV1CallOptions,
+  prompt: V3Prompt,
+  options: V3CallOptions,
   apiKey: string,
   userJwt: string,
   conversationId?: string,
@@ -295,18 +281,16 @@ function buildDevinChatRequest(
       ? [...DEVIN_DEFAULT_STOP_PATTERNS, ...options.stopSequences]
       : DEVIN_DEFAULT_STOP_PATTERNS;
 
-  const tools = options.mode?.type === "regular" && options.mode.tools
-    ? options.mode.tools
-        .filter((t): t is { type: "function"; name: string; description?: string; parameters: any } => t.type === "function")
-        .map((tool) =>
-          create(ChatToolDefinitionSchema, {
-            name: tool.name,
-            description: tool.description ?? "",
-            jsonSchemaString: JSON.stringify(tool.parameters),
-            strict: false,
-          }),
-        )
-    : [];
+  const tools = (options.tools ?? [])
+    .filter((t: any) => t.type === "function")
+    .map((tool: any) =>
+      create(ChatToolDefinitionSchema, {
+        name: tool.name,
+        description: tool.description ?? "",
+        jsonSchemaString: JSON.stringify(tool.inputSchema ?? tool.parameters ?? {}),
+        strict: false,
+      }),
+    );
 
   return create(GetChatMessageRequestSchema, {
     metadata: create(MetadataSchema, {
@@ -330,7 +314,7 @@ function buildDevinChatRequest(
     executionId: crypto.randomUUID(),
     configuration: create(CompletionConfigurationSchema, {
       numCompletions: 1n,
-      maxTokens: BigInt(options.maxTokens ?? 64000),
+      maxTokens: BigInt(options.maxOutputTokens ?? 64000),
       maxNewlines: 200n,
       temperature: options.temperature ?? 0.4,
       firstTemperature: options.temperature ?? 0.4,
@@ -360,13 +344,11 @@ function readConnectTrailerError(text: string): string | null {
   return `Devin stream error${code ? ` ${code}` : ""}: ${message}`;
 }
 
-class DevinCascadeLanguageModel implements LanguageModelV1 {
-  readonly specificationVersion = "v1" as const;
+class DevinCascadeLanguageModel {
+  readonly specificationVersion = "v3" as const;
   readonly provider = "devin";
   readonly modelId: string;
-  readonly defaultObjectGenerationMode = undefined;
-  readonly supportsImageUrls = false;
-  readonly supportsStructuredOutputs = false;
+  readonly supportedUrls: Record<string, RegExp[]> = {};
 
   private readonly settings: DevinCascadeSettings;
   private readonly modelSettings: DevinCascadeModelSettings;
@@ -381,11 +363,14 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
     this.modelSettings = modelSettings;
   }
 
-  async doGenerate(options: LanguageModelV1CallOptions): Promise<any> {
+  async doGenerate(options: V3CallOptions): Promise<any> {
     const { stream } = await this.doStream(options);
     let text = "";
-    let finishReason: LanguageModelV1FinishReason = "stop";
-    let usage = { promptTokens: 0, completionTokens: 0 };
+    let finishReason: V3FinishReason = { unified: "stop" };
+    let usage: V3Usage = {
+      inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+      outputTokens: { total: 0, text: 0, reasoning: 0 },
+    };
     const toolCalls: any[] = [];
 
     const reader = stream.getReader();
@@ -394,12 +379,12 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
         const { done, value } = await reader.read();
         if (done) break;
         if (value.type === "text-delta") {
-          text += value.textDelta;
+          text += value.delta;
         } else if (value.type === "tool-call") {
           toolCalls.push(value);
         } else if (value.type === "finish") {
-          finishReason = value.finishReason;
-          usage = value.usage;
+          finishReason = value.finishReason as V3FinishReason;
+          usage = value.usage as V3Usage;
         }
       }
     } finally {
@@ -411,17 +396,16 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
       finishReason,
       usage,
-      rawCall: { rawPrompt: options.prompt, rawSettings: {} },
     };
   }
 
   async doStream(
-    options: LanguageModelV1CallOptions,
-  ): Promise<{ stream: ReadableStream<LanguageModelV1StreamPart>; rawCall: any }> {
+    options: V3CallOptions,
+  ): Promise<{ stream: ReadableStream<V3StreamPart>; response?: any }> {
     const fetchImpl = this.settings.fetchImpl ?? fetch;
     const baseUrl = (this.settings.baseURL ?? DEVIN_CASCADE_URL).replace(/\/+$/, "");
 
-    const providerApiKey = options.providerMetadata?.devin?.apiKey;
+    const providerApiKey = options.providerOptions?.devin?.apiKey;
     const apiKey = normalizeDevinSessionToken(
       this.settings.apiKey ??
         (typeof providerApiKey === "string" ? providerApiKey : undefined) ??
@@ -490,23 +474,26 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
       });
     }
 
-    const stream = new ReadableStream<LanguageModelV1StreamPart>({
+    const stream = new ReadableStream<V3StreamPart>({
       async start(controller) {
+        const textId = "text-0";
+        const reasoningId = "reasoning-0";
+        let textStarted = false;
+        let reasoningStarted = false;
+        const toolBlocks = new Map<string, { id: string; name: string; args: string }>();
+        const toolPartialJson = new Map<string, string>();
+        let activeToolCallId: string | undefined;
+        let latestStopReason = StopReason.UNSPECIFIED;
+        let usage: V3Usage = {
+          inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+          outputTokens: { total: 0, text: 0, reasoning: 0 },
+        };
+
         try {
-          controller.enqueue({
-            type: "response-metadata",
-          });
+          controller.enqueue({ type: "stream-start", warnings: [] });
 
           const reader = response.body!.getReader();
           let pending = Buffer.alloc(0);
-
-          // Tool-call tracking
-          const toolBlocks = new Map<string, { id: string; name: string; args: string }>();
-          const toolPartialJson = new Map<string, string>();
-          let activeToolCallId: string | undefined;
-          let latestStopReason = StopReason.UNSPECIFIED;
-          let usage = { promptTokens: 0, completionTokens: 0 };
-          let responseId: string | undefined;
 
           for (;;) {
             const { done, value } = await reader.read();
@@ -533,24 +520,46 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
 
               const raw = flag & CONNECT_COMPRESSED_FLAG ? gunzipSync(payload) : payload;
               const msg = fromBinary(GetChatMessageResponseSchema, raw);
-              if (msg.messageId && !responseId) responseId = msg.messageId;
 
               if (msg.deltaThinking) {
-                // Emit thinking as text-delta (AI SDK v1 doesn't have a dedicated thinking part)
+                if (!reasoningStarted) {
+                  controller.enqueue({ type: "reasoning-start", id: reasoningId });
+                  reasoningStarted = true;
+                }
                 controller.enqueue({
-                  type: "text-delta",
-                  textDelta: msg.deltaThinking,
+                  type: "reasoning-delta",
+                  id: reasoningId,
+                  delta: msg.deltaThinking,
                 });
               }
 
               if (msg.deltaText) {
+                // End reasoning block if text starts
+                if (reasoningStarted) {
+                  controller.enqueue({ type: "reasoning-end", id: reasoningId });
+                  reasoningStarted = false;
+                }
+                if (!textStarted) {
+                  controller.enqueue({ type: "text-start", id: textId });
+                  textStarted = true;
+                }
                 controller.enqueue({
                   type: "text-delta",
-                  textDelta: msg.deltaText,
+                  id: textId,
+                  delta: msg.deltaText,
                 });
               }
 
               if (msg.deltaToolCalls.length > 0) {
+                // End text/reasoning blocks if tool calls start
+                if (textStarted) {
+                  controller.enqueue({ type: "text-end", id: textId });
+                  textStarted = false;
+                }
+                if (reasoningStarted) {
+                  controller.enqueue({ type: "reasoning-end", id: reasoningId });
+                  reasoningStarted = false;
+                }
                 for (const tc of msg.deltaToolCalls) {
                   const toolCallId = tc.id || activeToolCallId;
                   if (!toolCallId) continue;
@@ -559,6 +568,11 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
                     block = { id: toolCallId, name: tc.name, args: "" };
                     toolBlocks.set(toolCallId, block);
                     toolPartialJson.set(toolCallId, "");
+                    controller.enqueue({
+                      type: "tool-input-start",
+                      id: toolCallId,
+                      toolName: tc.name,
+                    });
                   }
                   if (tc.name) block.name = tc.name;
                   activeToolCallId = toolCallId;
@@ -567,8 +581,14 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
                   const accumulated = tc.argumentsJson.startsWith(previousJson)
                     ? tc.argumentsJson
                     : previousJson + tc.argumentsJson;
+                  const delta = accumulated.slice(previousJson.length);
                   toolPartialJson.set(toolCallId, accumulated);
                   block.args = accumulated;
+                  controller.enqueue({
+                    type: "tool-input-delta",
+                    id: toolCallId,
+                    delta,
+                  });
                 }
               }
 
@@ -578,8 +598,17 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
 
               if (msg.usage) {
                 usage = {
-                  promptTokens: Number(msg.usage.inputTokens),
-                  completionTokens: Number(msg.usage.outputTokens),
+                  inputTokens: {
+                    total: Number(msg.usage.inputTokens) || undefined,
+                    noCache: undefined,
+                    cacheRead: Number(msg.usage.cacheReadTokens) || undefined,
+                    cacheWrite: Number(msg.usage.cacheWriteTokens) || undefined,
+                  },
+                  outputTokens: {
+                    total: Number(msg.usage.outputTokens) || undefined,
+                    text: undefined,
+                    reasoning: undefined,
+                  },
                 };
               }
             }
@@ -587,29 +616,31 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
             if (done) break;
           }
 
-          // Emit finalized tool calls
+          // Close any open blocks
+          if (reasoningStarted) {
+            controller.enqueue({ type: "reasoning-end", id: reasoningId });
+          }
+          if (textStarted) {
+            controller.enqueue({ type: "text-end", id: textId });
+          }
+
+          // Finalize tool calls
           for (const [, block] of toolBlocks) {
-            let parsedArgs: unknown;
-            try {
-              parsedArgs = JSON.parse(block.args);
-            } catch {
-              parsedArgs = block.args;
-            }
+            controller.enqueue({ type: "tool-input-end", id: block.id });
             controller.enqueue({
               type: "tool-call",
-              toolCallType: "function",
               toolCallId: block.id,
               toolName: block.name,
-              args: JSON.stringify(parsedArgs),
+              input: block.args,
             });
           }
 
-          const finishReason: LanguageModelV1FinishReason =
-            toolBlocks.size > 0
-              ? "tool-calls"
-              : latestStopReason === StopReason.MAX_TOKENS
-                ? "length"
-                : "stop";
+          const hasToolCalls = toolBlocks.size > 0;
+          const finishReason: V3FinishReason = hasToolCalls
+            ? { unified: "tool-calls", raw: String(latestStopReason) }
+            : latestStopReason === StopReason.MAX_TOKENS
+              ? { unified: "length", raw: String(latestStopReason) }
+              : { unified: "stop", raw: String(latestStopReason) };
 
           controller.enqueue({
             type: "finish",
@@ -628,25 +659,19 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
       },
     });
 
-    return {
-      stream,
-      rawCall: {
-        rawPrompt: options.prompt,
-        rawSettings: { chatModelUid: this.modelSettings.chatModelUid ?? this.modelId },
-      },
-    };
+    return { stream };
   }
 }
 
 /**
  * Create a configured Devin Cascade AI SDK provider.
  * Returns an object with a `languageModel(modelId)` method, matching the
- * shape OpenCode expects from a provider factory (like `createOpenAICompatible`).
+ * shape OpenCode expects from a provider factory.
  */
 export function createDevinCascadeProvider(
   settings: DevinCascadeSettings = {},
 ): {
-  languageModel(modelId: string, modelSettings?: DevinCascadeModelSettings): LanguageModelV1;
+  languageModel(modelId: string, modelSettings?: DevinCascadeModelSettings): DevinCascadeLanguageModel;
 } {
   return {
     languageModel(modelId, modelSettings) {
@@ -656,6 +681,6 @@ export function createDevinCascadeProvider(
 }
 
 /**
- * Default Devin Cascade provider instance. Uses `DEVIN_API_KEY` env var.
+ * Default Devin Cascade provider instance.
  */
 export const devin = createDevinCascadeProvider({});
