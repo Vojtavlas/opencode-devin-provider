@@ -295,7 +295,7 @@ function buildDevinChatRequest(
       ? [...DEVIN_DEFAULT_STOP_PATTERNS, ...options.stopSequences]
       : DEVIN_DEFAULT_STOP_PATTERNS;
 
-  const tools = options.mode.type === "regular" && options.mode.tools
+  const tools = options.mode?.type === "regular" && options.mode.tools
     ? options.mode.tools
         .filter((t): t is { type: "function"; name: string; description?: string; parameters: any } => t.type === "function")
         .map((tool) =>
@@ -421,9 +421,10 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
     const fetchImpl = this.settings.fetchImpl ?? fetch;
     const baseUrl = (this.settings.baseURL ?? DEVIN_CASCADE_URL).replace(/\/+$/, "");
 
+    const providerApiKey = options.providerMetadata?.devin?.apiKey;
     const apiKey = normalizeDevinSessionToken(
       this.settings.apiKey ??
-        (options.providerMetadata?.["devin"]?.apiKey as string | undefined) ??
+        (typeof providerApiKey === "string" ? providerApiKey : undefined) ??
         process.env.DEVIN_API_KEY,
     );
 
