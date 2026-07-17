@@ -22,10 +22,7 @@ const DEVIN_CASCADE_URL = "https://server.codeium.com";
 // Static fallback models (used when dynamic discovery fails)
 const FALLBACK_MODELS: Record<string, { name: string; reasoning?: boolean }> = {
   "swe-1-7": { name: "SWE-1-7", reasoning: true },
-  "swe-1-6": { name: "SWE-1-6", reasoning: true },
-  "gpt-5-6-sol": { name: "GPT-5.6 Sol", reasoning: true },
-  "gpt-5-6-luna": { name: "GPT-5.6 Luna", reasoning: true },
-  "gpt-5-6-terra": { name: "GPT-5.6 Terra", reasoning: true },
+  "glm-5.2-high": { name: "GLM-5.2 High", reasoning: true },
 };
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
