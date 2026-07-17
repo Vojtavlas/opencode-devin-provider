@@ -639,12 +639,19 @@ class DevinCascadeLanguageModel implements LanguageModelV1 {
 
 /**
  * Create a configured Devin Cascade AI SDK provider.
+ * Returns an object with a `languageModel(modelId)` method, matching the
+ * shape OpenCode expects from a provider factory (like `createOpenAICompatible`).
  */
 export function createDevinCascadeProvider(
   settings: DevinCascadeSettings = {},
-): (modelId: string, modelSettings?: DevinCascadeModelSettings) => LanguageModelV1 {
-  return (modelId, modelSettings) =>
-    new DevinCascadeLanguageModel(modelId, settings, modelSettings);
+): {
+  languageModel(modelId: string, modelSettings?: DevinCascadeModelSettings): LanguageModelV1;
+} {
+  return {
+    languageModel(modelId, modelSettings) {
+      return new DevinCascadeLanguageModel(modelId, settings, modelSettings);
+    },
+  };
 }
 
 /**

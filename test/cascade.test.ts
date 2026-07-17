@@ -23,7 +23,7 @@ function trailerFrame(json: string): Buffer {
 describe("Devin Cascade provider", () => {
   it("throws when api key is missing", async () => {
     const devin = createDevinCascadeProvider({});
-    const model = devin("swe-1-6");
+    const model = devin.languageModel("swe-1-6");
 
     await expect(
       model.doStream({

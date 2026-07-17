@@ -2,9 +2,21 @@ import type { Plugin, Hooks, Config } from "@opencode-ai/plugin";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { fetchDevinModels } from "./discovery.js";
 
 const DEVIN_CALLBACK_PORT = 59653;
+
+/**
+ * Resolve the file:// URL for the `./devin.ts` entry point.
+ * OpenCode's provider loader checks for `file://` prefix and imports directly,
+ * bypassing `Npm.add()` (which would fail for unpublished local packages).
+ */
+const DEVIN_PROVIDER_NPM = (() => {
+  const here = new URL(import.meta.url);
+  const devinPath = path.resolve(path.dirname(here.pathname.replace(/^\//, "")), "devin.ts");
+  return pathToFileURL(devinPath).href;
+})();
 
 // Static fallback models (used when dynamic discovery fails)
 const FALLBACK_MODELS: Record<string, { name: string; reasoning?: boolean }> = {
@@ -112,7 +124,7 @@ const devinPlugin: Plugin = async () => {
             api: {
               id: m.id,
               url: "https://server.codeium.com",
-              npm: "opencode-devin-provider/devin",
+              npm: DEVIN_PROVIDER_NPM,
             },
             capabilities: {
               temperature: true,
@@ -168,14 +180,14 @@ const devinPlugin: Plugin = async () => {
 
       if (!cfg.provider.devin) {
         cfg.provider.devin = {
-          npm: "opencode-devin-provider/devin",
+          npm: DEVIN_PROVIDER_NPM,
           name: "Devin",
           options: {},
           models: {},
         };
       } else {
-        if (!cfg.provider.devin.npm) {
-          cfg.provider.devin.npm = "opencode-devin-provider/devin";
+        if (!cfg.provider.devin.npm || cfg.provider.devin.npm === "opencode-devin-provider/devin") {
+          cfg.provider.devin.npm = DEVIN_PROVIDER_NPM;
         }
         if (!cfg.provider.devin.name) {
           cfg.provider.devin.name = "Devin";
@@ -207,7 +219,7 @@ function buildFallbackModels(): Record<string, any> {
       api: {
         id,
         url: "https://server.codeium.com",
-        npm: "opencode-devin-provider/devin",
+        npm: DEVIN_PROVIDER_NPM,
       },
       capabilities: {
         temperature: true,
