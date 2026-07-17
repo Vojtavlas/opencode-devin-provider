@@ -1,7 +1,7 @@
 {
   "name": "opencode-devin-provider",
   "version": "0.1.0",
-  "description": "Use Devin as an OpenCode chat provider via the official Devin v3 REST API.",
+  "description": "Use Devin as an OpenCode chat provider via the Codeium/Windsurf Cascade Connect protocol.",
   "type": "module",
   "module": "src/index.ts",
   "main": "src/index.ts",
@@ -11,7 +11,7 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm",
+    "build": "bun build src/index.ts src/devin.ts --outdir dist --target node --format esm",
     "test": "bun test",
     "lint": "bun run --bun tsc --noEmit"
   },
@@ -28,7 +28,8 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@ai-sdk/provider": "^1.0.0"
+    "@ai-sdk/provider": "^1.0.0",
+    "@bufbuild/protobuf": "^2.12.1"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.14.48",

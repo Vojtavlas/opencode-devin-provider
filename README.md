@@ -1,25 +1,50 @@
 # opencode-devin-provider
 
-Use [Devin](https://devin.ai) as an [OpenCode](https://opencode.ai) chat provider through the official Devin v3 REST API.
+Use [Devin](https://devin.ai) as an [OpenCode](https://opencode.ai) chat provider through the Codeium/Windsurf Cascade Connect protocol.
 
-This plugin is modeled on the provider-plugin architecture used by projects like `oh-my-pi`, but it targets the **official, public Devin API** instead of reverse-engineering internal endpoints.
+This plugin replicates the approach pioneered by [oh-my-pi](https://github.com/can1357/oh-my-pi): it speaks Devin's internal protobuf + Connect streaming protocol directly, giving you first-class access to Devin's models (SWE-1, GPT-5.6 Sol/Luna/Terra, etc.) with streaming text, thinking/reasoning, and tool-call support — all from within OpenCode.
 
-## What it does
+## How it works
 
-- Registers a `devin` provider in OpenCode with models like `devin`, `devin-fast`, `devin-lite`, `devin-ultra`, and `devin-fusion`.
-- Each OpenCode chat message creates a Devin cloud session.
-- The provider polls `GET /v3/organizations/{org}/sessions/{devin_id}/messages` and streams new assistant text back to OpenCode as it appears.
-- No separate terminal script is needed; everything runs inside OpenCode.
+```
+OpenCode chat message
+    ↓
+Devin CLI session token (from /connect or DEVIN_API_KEY)
+    ↓
+Normalize to devin-session-token$<token>
+    ↓
+Codeium/Windsurf GetUserJwt RPC
+    ↓
+Build protobuf Cascade request (chat history + tools + system prompt)
+    ↓
+POST Connect stream to server.codeium.com
+    ↓
+Decode thinking/text/tool-call protobuf deltas
+    ↓
+Translate into Vercel AI SDK stream parts
+    ↓
+OpenCode executes tools locally and sends results next turn
+```
+
+Devin supplies the model access and inference backend. OpenCode supplies the coding-agent loop, filesystem tools, shell execution, session handling, and UI.
+
+## Features
+
+- **Real streaming** via Connect protocol (not poll-based like the v3 REST API)
+- **Thinking/reasoning support** — reasoning deltas are streamed as text
+- **Tool calls** — Devin proposes tool calls, OpenCode executes them locally
+- **Dynamic model discovery** — calls `GetCliModelConfigs` to find account-specific models
+- **Conversation threading** — reuses Cascade conversation IDs across turns
+- **PKCE OAuth support** — helper functions for the Devin CLI OAuth flow
 
 ## Prerequisites
 
-- A Devin account with an organization.
-- A Devin [service user](https://docs.devin.ai/api-reference/authentication) API key (`cog_...`) that has the `ManageOrgSessions` permission.
-- Your Devin organization ID (`org_...`).
+- A Devin account (any tier that includes CLI access).
+- A Devin CLI session token. Get one by running `devin login` in a terminal, or through the OAuth flow.
 
 ## Installation
 
-Add the plugin to your `opencode.json` (or `.opencode/opencode.json`):
+Add the plugin to your `opencode.json`:
 
 ```json
 {
@@ -27,16 +52,12 @@ Add the plugin to your `opencode.json` (or `.opencode/opencode.json`):
 }
 ```
 
-Then run OpenCode and use `/connect` to authenticate with Devin. The plugin will prompt for:
+Then run OpenCode and use `/connect` to authenticate with Devin. The plugin will prompt for your Devin CLI session token.
 
-- API key (`cog_...`)
-- Organization ID (`org-...`)
-
-Alternatively, set environment variables:
+Alternatively, set an environment variable:
 
 ```bash
-export DEVIN_API_KEY="cog_your_key"
-export DEVIN_ORG_ID="org_your_org"
+export DEVIN_API_KEY="your-devin-cli-token"
 ```
 
 Or configure the provider manually:
@@ -47,48 +68,49 @@ Or configure the provider manually:
   "provider": {
     "devin": {
       "options": {
-        "apiKey": "cog_your_key",
-        "orgId": "org_your_org"
+        "apiKey": "your-devin-cli-token"
       }
     }
   }
 }
 ```
 
-## Selecting the model
+## Selecting a model
 
 Pick a Devin model with `/models` or set it in config:
 
 ```json
 {
-  "model": "devin/devin-fast"
+  "model": "devin/swe-1-6"
 }
 ```
 
-Model IDs map to Devin `devin_mode` values:
+Available models are discovered dynamically from your account. If discovery fails, fallback models (SWE-1-6, GPT-5.6 Sol/Luna/Terra) are provided.
 
-- `devin` → `normal`
-- `devin-fast` → `fast`
-- `devin-lite` → `lite`
-- `devin-ultra` → `ultra`
-- `devin-fusion` → `fusion`
+## Architecture
 
-## How it works
+### Connect protocol
 
-OpenCode calls the Vercel AI SDK provider exported by `opencode-devin-provider/devin`. The provider's `doStream` method:
+The provider serializes requests as protobuf, gzips them, and frames them with the Connect streaming envelope (1-byte flag + 4-byte big-endian length + payload). Responses are decoded frame-by-frame, with support for:
 
-1. Renders the conversation into a single prompt string.
-2. Calls `POST /v3/organizations/{org}/sessions` with `devin_mode`.
-3. Polls `GET .../sessions/{devin_id}` for status and `GET .../messages` for assistant messages.
-4. Emits `text-delta` parts as new `source: devin` messages arrive.
-5. Emits `finish` when the session reaches `exit`, `error`, or `suspended`.
+- Gzip-compressed frames (flag `0x01`)
+- End-of-stream JSON trailers (flag `0x02`)
+- 16 MiB frame size cap (defensive against corrupt length prefixes)
 
-## Limitations
+### Protobuf
 
-- Devin v3 API is **poll-only**. The provider simulates streaming by polling every 5 seconds (configurable).
-- Each OpenCode message starts a **new Devin cloud session**. There is no conversation continuity across messages in the current version.
-- Devin runs in a cloud VM, so it does not directly edit your local files. It returns text/output and can create PRs.
-- Token usage is not returned by the Devin v3 API, so usage counts are reported as `0`.
+The `.proto` files from Codeium/Windsurf's internal protocol are included in `src/devin-gen/`, with TypeScript schemas generated by `protoc-gen-es` (via `@bufbuild/protobuf`). Only the transitive subset needed by the chat flow is used at runtime.
+
+### Model discovery
+
+When credentials are available, the plugin calls `GetCliModelConfigs` against the Codeium server to discover account-specific models. Each returned model configuration is normalized into OpenCode's model format with capabilities, limits, and reasoning detection.
+
+### Reasoning detection
+
+The discovery endpoint doesn't always expose clean thinking metadata, so reasoning support is detected using:
+- `modelFeatures.supportsThinking`
+- Labels containing terms like "thinking", "high", "medium", "xhigh", "max", or "reasoning"
+- A "no thinking" exclusion pattern
 
 ## Development
 
@@ -98,6 +120,10 @@ bun test
 bun run lint
 bun build src/index.ts src/devin.ts --outdir dist --target node --format esm
 ```
+
+## Credits
+
+This project replicates the Devin integration approach from [oh-my-pi](https://github.com/can1357/oh-my-pi) by [@can1357](https://github.com/can1357). The protobuf definitions and Connect protocol implementation are derived from that work.
 
 ## License
 
